@@ -1,0 +1,37 @@
+[package]
+name = "aoc2025"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+argh = "0.1"
+colored = "2"
+serde = { version = "1.0", features = ["derive"] }
+paste = "1.0"
+serde_yaml = "0.9"
+itertools = "0.13.0"
+graphviz-rust = "0.9.3"
+
+[dev-dependencies]
+criterion = "0.5.1"
+
+# The "debug" profile
+[profile.release]
+panic = "abort"
+debug = true
+lto = "thin"
+
+# The profile to benchmark with (`cargo run --profile benchmark`)
+[profile.benchmark]
+inherits = "release"
+debug = false
+lto = "fat"
+
+[profile.bench]
+inherits = "release"
+debug = false
+lto = "fat"
+
+[[bench]]
+name = "bench"
+harness = false
