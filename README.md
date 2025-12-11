@@ -17,4 +17,7 @@ cargo run --release
 
 # Run specific day
 cargo run --release -- 1 # run day 1
+
+# Run with different input directory
+cargo run --release -- 1 -i owen
 ```
