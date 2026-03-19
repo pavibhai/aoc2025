@@ -1,8 +1,7 @@
-use std::time::SystemTime;
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap};
+use z3::ast::Int;
+use z3::Optimize;
+use std::collections::{HashSet};
 use std::mem::swap;
-use itertools::Itertools;
 
 pub fn part1(machines: &[Machine]) -> u32 {
     machines.iter().map(|m| m.steps_to_target())
@@ -10,9 +9,8 @@ pub fn part1(machines: &[Machine]) -> u32 {
 }
 
 pub fn part2(machines: &[Machine]) -> u32 {
-    machines.iter().enumerate().map(|(idx, m)| {
-        println!("{:?}: {}", SystemTime::now(), idx);
-        m.steps_to_joltage()
+    machines.iter().map(|m| {
+        m.steps_to_joltage() as u32
     })
         .sum()
 }
@@ -27,8 +25,8 @@ pub fn generator(input: &str) -> Vec<Machine> {
 pub struct Machine {
     target: u32,
     start: u32,
-    buttons: Vec<Vec<usize>>,
-    joltage: Vec<u32>,
+    buttons: Vec<Vec<bool>>,
+    counters: Vec<Counter>,
 }
 
 impl Machine {
@@ -42,39 +40,59 @@ impl Machine {
                 bits += 1;
                 (acc << 1) + if c == '.' { 0 } else { 1 }
             });
-        let joltage = splits.next_back().unwrap();
-        let joltage = joltage.strip_prefix('{').unwrap()
+        let counters = splits.next_back().unwrap();
+        let counters: Vec<u32> = counters.strip_prefix('{').unwrap()
             .strip_suffix('}').unwrap()
             .split(',')
             .map(|s| s.parse::<u32>().unwrap())
             .collect();
 
-        let buttons = splits.map(|b| {
+        let buttons: Vec<Vec<bool>> = splits.map(|b| {
+            let mut joltages = vec![false; counters.len()];
             b.strip_prefix('(').unwrap()
                 .strip_suffix(')').unwrap()
                 .split(',')
-                .map(|s| s.parse::<usize>().unwrap())
-                .sorted()
-                .collect()
+                .for_each(|s| joltages[s.parse::<usize>().unwrap()] = true);
+            joltages
         }).collect();
+        let counters: Vec<Counter> = counters.into_iter().enumerate()
+            .map(|(c_idx, target)| {
+                Counter {
+                    target,
+                    buttons: buttons.iter()
+                        .map(|counters| counters[c_idx]).collect(),
+                }
+            }).collect();
 
-        Machine { target, start: 0, joltage, buttons }
+        Machine { target, start: 0, counters, buttons }
     }
 
     fn steps_to_target(&self) -> u32 {
+        let mut seen = HashSet::new();
+        seen.insert(self.start);
         let buttons = self.buttons.iter().map(|b| {
-            b.iter().map(|b| 1 << (self.joltage.len() - 1 - b))
+            b.iter().enumerate()
+                .filter(|(_, v)| **v)
+                .map(|(idx, _)| 1 << (self.counters.len() - 1 - idx))
                 .fold(0u32, |acc, v| acc ^ v)
         }).collect::<Vec<_>>();
         let mut values = vec![self.start];
         let mut next: Vec<u32> = Vec::new();
         let mut steps = 0;
-        while !values.contains(&self.target) {
+        'main: loop {
             next.clear();
             steps += 1;
             for c in values.iter() {
                 for b in buttons.iter() {
-                    next.push(c ^ *b);
+                    let next_value = c ^ *b;
+                    match c ^ *b {
+                        v if v == self.target => break 'main,
+                        v if seen.contains(&v) => continue,
+                        _ => {
+                            next.push(next_value);
+                            seen.insert(next_value);
+                        }
+                    }
                 }
             }
             swap(&mut values, &mut next);
@@ -82,242 +100,56 @@ impl Machine {
         steps
     }
 
-    fn steps_to_joltage(&self) -> u32 {
-        let mut e = Evaluator::new(self);
-        e.solve()
-    }
-}
+    fn steps_to_joltage(&self) -> u64 {
+        let opt = Optimize::new();
+        let buttons = self.buttons.iter().enumerate().map(|(idx, _)| {
+            Int::new_const(format!("b{idx}").to_string())
+        }).collect::<Vec<_>>();
+        buttons.iter().for_each(|b| opt.assert(b.ge(0)));
 
-#[derive(Debug, Clone)]
-struct Joltage {
-    target: u32,
-    buttons: Vec<usize>,
-}
-
-#[derive(Debug, Clone)]
-struct State {
-    joltage: Vec<u32>,
-    steps: u32,
-}
-
-impl State {
-    fn speed(&self) -> u32 {
-        self.joltage.iter().sum::<u32>() * 1000000 / self.steps
-    }
-}
-
-impl PartialEq for State {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other).is_eq()
-    }
-}
-
-impl Eq for State {}
-
-impl Ord for State {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other.steps.cmp(&self.steps).then(self.speed().cmp(&other.speed()))
-    }
-}
-
-impl PartialOrd for State {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Evaluator {
-    buttons: Vec<Vec<usize>>,
-    joltage: Vec<Joltage>,
-    skip: Vec<bool>,
-    skip_next: Vec<bool>,
-    common_buttons: Vec<Vec<Option<Vec<usize>>>>,
-}
-
-impl Evaluator {
-    fn new(machine: &Machine) -> Self {
-        let mut joltage = vec![Vec::new(); machine.joltage.len()];
-        machine.buttons.iter().enumerate()
-            .for_each(|(b_idx, b)| {
-                b.iter().for_each(|j_idx| {
-                    joltage[*j_idx].push(b_idx)
-                });
-            });
-        let joltage: Vec<Joltage> = joltage.into_iter().enumerate()
-            .map(|(j_idx, mut buttons)| {
-                buttons.sort();
-                Joltage { target: machine.joltage[j_idx], buttons }
-            })
-            .collect();
-        let common_buttons = Self::find_common_buttons(&joltage);
-
-        Evaluator {
-            joltage,
-            buttons: machine.buttons.clone(),
-            skip: vec![false; machine.buttons.len()],
-            skip_next: vec![false; machine.buttons.len()],
-            common_buttons,
-        }
-    }
-
-    fn find_common_buttons(joltage: &[Joltage]) -> Vec<Vec<Option<Vec<usize>>>> {
-        let mut common_buttons = vec![vec![None; joltage.len()]; joltage.len()];
-        for i in 0..joltage.len() {
-            for j in 0..joltage.len() {
-                if i == j {
-                    continue;
-                }
-                common_buttons[i][j] = Some(joltage[i].buttons
-                    .iter()
-                    .filter(|b_idx| joltage[j].buttons.contains(b_idx))
-                    .cloned()
-                    .collect_vec());
-            }
-        }
-        common_buttons
-    }
-
-    fn no_of_combinations(buttons: usize, value: u32) -> u64 {
-        //println!("buttons {}, value {}", buttons, value);
-        let mut result = 1;
-        for d in 0..value {
-            result *= (buttons as u64 - 1 + (value - d) as u64) / (value - d) as u64;
-        }
-        result
-    }
-
-    fn press(&self, b_idx: &usize, joltage: &mut [u32], times: u32) {
-        self.buttons[*b_idx].iter().for_each(|j_idx| { joltage[*j_idx] += times })
-    }
-
-    fn un_press(&self, b_idx: &usize, joltage: &mut [u32], times: u32) {
-        self.buttons[*b_idx].iter().for_each(|j_idx| { joltage[*j_idx] -= times })
-    }
-
-    fn initialize_skips(&mut self, state: &State) {
-        self.skip.iter_mut().for_each(|skip| *skip = false);
-        self.skip_next.iter_mut().for_each(|skip| *skip = false);
-        self.joltage.iter()
-            .zip(state.joltage.iter())
-            .filter(|(t, c)| &&t.target == c)
-            .for_each(|(t, _)| {
-                t.buttons.iter().for_each(|b_idx| {
-                    self.skip[*b_idx] = true;
-                    self.skip_next[*b_idx] = true;
+        for c in self.counters.iter() {
+            let _value = Int::from_u64(c.target as u64);
+            let _sum: Vec<&Int> = c.buttons.iter().enumerate()
+                .filter(|(_, v)| **v)
+                .map(|(idx, _)| {
+                    &buttons[idx]
                 })
-            });
-    }
+                .collect();
+            opt.assert(Int::add(&_sum).eq(c.target));
+        }
+        let _button_sum: Vec<&Int> = buttons.iter().collect();
+        opt.minimize(&Int::add(&_button_sum));
 
-    fn find_next_joltage(&self, state: &State) -> Option<usize> {
-        state.joltage.iter()
-            .zip(self.joltage.iter())
-            .enumerate()
-            .filter(|&(_, (c, t))| c < &t.target)
-            .map(|(j_idx, (c, t))| {
-                (j_idx, (c, t), t.buttons.iter().filter(|b_idx| !self.skip[**b_idx]).count())
-            })
-            .filter(|(_, _, bsize)| bsize > &0)
-            .min_by_key(|(_, (c, t), bsize)| Self::no_of_combinations(*bsize, t.target - **c))
-            .map(|(j_idx, _, _)| j_idx)
-    }
-
-    fn solve(&mut self) -> u32 {
-        let mut to_process = BinaryHeap::new();
-        to_process.push(State { steps: 0, joltage: vec![0u32; self.joltage.len()] });
-        let target: Vec<u32> = self.joltage.iter().map(|j| j.target).collect();
-
-        while let Some(mut state) = to_process.pop() {
-            //writeln!(&mut output, "Processing {:?}/{}", state.joltage, state.steps).unwrap();
-            if state.joltage == target {
-                return state.steps;
+        match opt.check(&[]) {
+            z3::SatResult::Sat => {
+                let model = opt.get_model().unwrap();
+                buttons.iter().map(|b| {
+                    let times = match model.eval(b, false) {
+                        Some(val) => val.as_u64().unwrap_or(0),
+                        None => 0,
+                    };
+                    times
+                })
+                    .sum()
             }
-
-            self.initialize_skips(&state);
-
-            let j_idx = self.find_next_joltage(&state);
-            if j_idx.is_none() { continue; }
-            let j_idx = j_idx.unwrap();
-            let current_value = &state.joltage[j_idx];
-            let joltage = &self.joltage[j_idx];
-
-            for b_idx in joltage.buttons.iter() {
-                self.skip_next[*b_idx] = true;
-            }
-
-            for new_presses in joltage.buttons.iter()
-                .filter(|b_idx| !self.skip[**b_idx])
-                .combinations_with_replacement((joltage.target - current_value) as usize)
-                .map(|c| c.into_iter().dedup_with_count().collect::<Vec<(usize, &usize)>>()) {
-                new_presses.iter().for_each(|(presses, b_idx)| {
-                    self.press(b_idx, &mut state.joltage, *presses as u32);
-                    state.steps += *presses as u32;
-                });
-
-                if self.is_valid(&state.joltage) {
-                    to_process.push(state.clone());
-                }
-
-                new_presses.iter().for_each(|(presses, b_idx)| {
-                    self.un_press(b_idx, &mut state.joltage, *presses as u32);
-                    state.steps -= *presses as u32;
-                });
+            _ => {
+                unreachable!();
             }
         }
-        unreachable!()
     }
+}
 
-    fn is_valid(&self, joltage: &[u32]) -> bool {
-        let mut button_max = vec![(0usize, u32::MAX); self.buttons.len()];
-        for ((j_idx, c), t) in joltage.iter().enumerate().zip(self.joltage.iter()) {
-            if c > &t.target {
-                return false;
-            }
-            for b_idx in t.buttons.iter() {
-                match button_max.get_mut(*b_idx) {
-                    Some((min_j_idx, v)) if *v > t.target - c => {
-                        *min_j_idx = j_idx;
-                        *v = t.target - c;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        'joltage: for ((j_idx, c), t) in joltage.iter().enumerate().zip(self.joltage.iter()) {
-            let mut remaining = t.buttons.clone();
-            remaining.retain(|b_idx| button_max[*b_idx].1 > 0);
-            let mut max_value = 0u32;
-            while !remaining.is_empty() {
-                let (s_j_idx, count, _) = (0..joltage.len())
-                    .filter(|s_j_idx| s_j_idx != &j_idx)
-                    .map(|s_j_idx| {
-                        (s_j_idx,
-                         self.common_buttons[j_idx][s_j_idx].as_ref().unwrap()
-                             .iter()
-                             .filter(|b_idx| remaining.binary_search(b_idx).is_ok() && button_max[**b_idx].1 > 0)
-                             .count(),
-                         1000000 - self.joltage[s_j_idx].target - joltage[s_j_idx]
-                        )
-                    })
-                    .max_by_key(|(_, count, value)| (*count, *value)).unwrap();
-                if count == 0 {
-                    continue 'joltage;
-                }
-                max_value += self.joltage[s_j_idx].target - joltage[s_j_idx];
-                remaining.retain(|b_idx| self.joltage[s_j_idx].buttons.binary_search(b_idx).is_err());
-            }
-
-            if t.target - c > max_value {
-                return false;
-            }
-        }
-        true
-    }
+#[derive(Debug)]
+struct Counter {
+    target: u32,
+    buttons: Vec<bool>,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{generator, part1, part2, Evaluator, Machine};
+    use z3::ast::Int;
+    use z3::{Optimize};
+    use super::{generator, part1, part2, Machine};
 
     const INPUT: &str = "[.##.] (3) (1,3) (2) (2,3) (0,2) (0,1) {3,5,4,7}
 [...#.] (0,2,3,4) (2,3) (0,4) (0,1,2) (1,2,3,4) {7,5,12,7,2}
@@ -330,7 +162,11 @@ mod tests {
 
         assert_eq!(6, machines[0].target);
         assert_eq!(0, machines[0].start);
-        assert_eq!(vec![3, 5, 4, 7], machines[0].joltage);
+        assert_eq!(machines[0].buttons[0], vec![false, false, false, true]);
+        assert_eq!(machines[0].buttons[1], vec![false, true, false, true]);
+        assert_eq!(machines[0].counters[0].target, 3);
+        assert_eq!(machines[0].counters[0].buttons, vec![false, false, false, false, true, true]);
+        assert_eq!(machines[0].counters[1].buttons, vec![false, true, false, false, false, true]);
     }
 
     #[test]
@@ -338,23 +174,6 @@ mod tests {
         let machines = generator(INPUT);
         assert_eq!(2, machines[0].steps_to_target());
         assert_eq!(7, part1(&machines));
-    }
-
-    #[test]
-    fn test_evaluator() {
-        let m = Machine::new("[.##.] (3) (1,3) (2) (2,3) (0,2) (0,1) {3,5,4,7}");
-        let e = Evaluator::new(&m);
-        assert_eq!(e.joltage.len(), m.joltage.len());
-        assert_eq!(e.joltage[0].target, 3);
-        assert_eq!(e.joltage[0].buttons, vec![4, 5]);
-
-        let m = Machine::new("[...#.] (0,2,3,4) (2,3) (0,4) (0,1,2) (1,2,3,4) {7,5,12,7,2}");
-        let e = Evaluator::new(&m);
-        assert_eq!(e.joltage.len(), m.joltage.len());
-        assert_eq!(e.joltage[0].target, 7);
-        assert_eq!(e.joltage[0].buttons, vec![0, 2, 3, ]);
-        assert_eq!(e.joltage[1].target, 5);
-        assert_eq!(e.joltage[1].buttons, vec![3, 4]);
     }
 
     #[test]
